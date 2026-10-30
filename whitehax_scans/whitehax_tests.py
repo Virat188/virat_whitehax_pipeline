@@ -6,7 +6,8 @@ Stable CI/SARIF handling plus a WhiteHax REST API adapter that:
 1. authenticates (API key + email/password session),
 2. starts a job against a configured profile (optionally creating an endpoint for TARGET_URL),
 3. polls until the job completes,
-4. fetches the report and maps failed tests into SARIF findings.
+4. fetches the report and maps failed tests into SARIF findings,
+5. fetches recommendations and writes them to the GitHub job summary.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import requests
 
@@ -41,6 +43,10 @@ SARIF_LEVELS = {
 DEFAULT_TIMEOUT = 30
 DEFAULT_POLL_INTERVAL = 10
 DEFAULT_POLL_TIMEOUT = 3600
+DEFAULT_RECOMM_TIMEOUT = 120
+# recomm_for selects the generator. "full" is the prompts-and-docs profile.
+RECOMM_FOR_VALUES = ("full", "rto", "dos", "mcp", "reg", "llm")
+RECOMM_LANGS = ("en", "fr", "es")
 
 
 def require_env(name: str) -> str:
@@ -300,6 +306,312 @@ class WhiteHaxClient:
         print(f"[INFO] Fetched WhiteHax report id={report_id}")
         return payload
 
+    def get_recommendations(self, report_id: str) -> Any:
+        """GET /api/readiness-score/recommendations/.
+
+        Query params:
+        - recomm_for: full (prompts and docs), rto, dos, mcp, reg, llm
+        - report_id: report to process
+        - lang: en (default), fr, es
+        - consolidation: false reads the result table; true reads consolidated_report
+        """
+        recomm_for = os.environ.get("WHITEHAX_RECOMM_FOR", "full").strip().lower() or "full"
+        lang = os.environ.get("WHITEHAX_LANG", "en").strip().lower() or "en"
+        consolidation = env_bool("WHITEHAX_CONSOLIDATION", default=False)
+        timeout = env_int("WHITEHAX_RECOMM_TIMEOUT", DEFAULT_RECOMM_TIMEOUT)
+        if recomm_for not in RECOMM_FOR_VALUES:
+            print(
+                f"[WARN] recomm_for={recomm_for!r} is not one of {', '.join(RECOMM_FOR_VALUES)}; "
+                "full is the prompts-and-docs profile"
+            )
+        if lang not in RECOMM_LANGS:
+            print(f"[WARN] lang={lang!r} is not one of {', '.join(RECOMM_LANGS)}; sending it anyway")
+        query = urlencode(
+            {
+                "recomm_for": recomm_for,
+                "report_id": report_id,
+                "lang": lang,
+                "consolidation": "true" if consolidation else "false",
+            }
+        )
+        url = f"{self.base_url}/api/readiness-score/recommendations/?{query}"
+        source = "consolidated_report" if consolidation else "result table"
+        print(
+            f"[INFO] Requesting recommendations report_id={report_id} "
+            f"recomm_for={recomm_for} lang={lang} consolidation={str(consolidation).lower()} "
+            f"source={source} timeout={timeout}s"
+        )
+        print(f"[INFO] GET {url}")
+        started = time.perf_counter()
+        payload = _request("GET", url, headers=self._headers(), timeout=timeout)
+        elapsed = time.perf_counter() - started
+        print(f"[INFO] Recommendations response received in {elapsed:.1f}s")
+        return payload
+
+
+def _md(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _label(key: Any) -> str:
+    return str(key).replace("_", " ").strip().capitalize()
+
+
+def _is_code_text(key: str, text: str) -> bool:
+    lowered = key.lower()
+    markers = ("code", "snippet", "pattern", "expression", "example", "regex")
+    return any(marker in lowered for marker in markers) or "\n" in text or len(text) > 240
+
+
+def _fence(text: str) -> list[str]:
+    tick = "```"
+    while tick in text:
+        tick += "`"
+    return ["", tick, text.rstrip("\n"), tick, ""]
+
+
+def _render_block(value: Any, level: int = 3) -> list[str]:
+    """Render a recommendation value without dropping nested text."""
+    if isinstance(value, dict):
+        lines: list[str] = []
+        for key, item in value.items():
+            key_text = str(key)
+            if isinstance(item, str) and _is_code_text(key_text, item):
+                lines.append(f"**{_label(key_text)}**")
+                lines.extend(_fence(item))
+                continue
+            if isinstance(item, (dict, list)):
+                lines.append(f"{'#' * min(level, 6)} {_label(key_text)}")
+                lines.append("")
+                lines.extend(_render_block(item, level + 1))
+                continue
+            lines.append(f"- **{_label(key_text)}:** {_md(item)}")
+        if lines and lines[-1] != "":
+            lines.append("")
+        return lines
+
+    if isinstance(value, list):
+        lines = []
+        for index, item in enumerate(value, start=1):
+            if isinstance(item, dict) and {"action", "priority", "implementation"} & item.keys():
+                lines.extend(_render_action(item, index))
+                continue
+            if isinstance(item, (dict, list)):
+                lines.append(f"{'#' * min(level, 6)} Item {index}")
+                lines.append("")
+                lines.extend(_render_block(item, level + 1))
+                continue
+            lines.append(f"- {_md(item)}")
+        if lines and lines[-1] != "":
+            lines.append("")
+        return lines
+
+    if isinstance(value, str) and _is_code_text("", value):
+        return _fence(value)
+    return [f"{_md(value)}", ""]
+
+
+def _render_action(action: dict[str, Any], index: int) -> list[str]:
+    priority = _md(action.get("priority")) or "Unspecified"
+    category = _md(action.get("category"))
+    title = _md(action.get("action") or action.get("title")) or "Action"
+    lines = [f"#### {index}. {title}", "", f"**{priority}**" + (f" · `{category}`" if category else ""), ""]
+    if action.get("description"):
+        lines.extend([_md(action.get("description")), ""])
+    steps = action.get("implementation") or []
+    if isinstance(steps, list) and steps:
+        lines.extend(["**Implementation**", ""])
+        for step in steps:
+            if isinstance(step, (dict, list)):
+                lines.extend(_render_block(step, 5))
+            else:
+                lines.append(f"- {_md(step)}")
+        lines.append("")
+    known = {"priority", "action", "title", "category", "description", "implementation"}
+    extra = {key: value for key, value in action.items() if key not in known}
+    if extra:
+        lines.extend(_render_block(extra, 5))
+    return lines
+
+
+def _recommendation_view(payload: Any) -> tuple[dict[str, Any], dict[str, Any], list[Any]]:
+    data = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(data, dict):
+        return {}, {}, []
+    assessment = data.get("overall_assessment")
+    summary = data.get("executive_summary")
+    actions = data.get("prioritized_actions")
+    return (
+        assessment if isinstance(assessment, dict) else {},
+        summary if isinstance(summary, dict) else {},
+        actions if isinstance(actions, list) else [],
+    )
+
+
+def _posture_alert(posture: str) -> str:
+    text = posture.strip().lower()
+    if "critical" in text:
+        return "CAUTION"
+    if "high" in text or "urgent" in text:
+        return "WARNING"
+    if "medium" in text:
+        return "IMPORTANT"
+    return "NOTE"
+
+
+def format_recommendations(payload: Any, report_id: str) -> str:
+    documents = payload if isinstance(payload, list) else [payload]
+    lines = ["## WhiteHax recommendations", "", f"Report `{report_id}`", ""]
+    if not documents:
+        lines.extend(["No recommendation payload was returned.", ""])
+        return "\n".join(lines)
+
+    for document_index, document in enumerate(documents, start=1):
+        if not isinstance(document, dict):
+            if len(documents) > 1:
+                lines.extend([f"### Document {document_index}", ""])
+            lines.extend(_render_block(document))
+            continue
+
+        assessment, summary, actions = _recommendation_view(document)
+        posture = str(assessment.get("security_posture") or summary.get("security_status") or "")
+        timeline = str(assessment.get("remediation_timeline") or summary.get("recommended_timeline") or "")
+        if len(documents) > 1:
+            lines.extend([f"### Document {document_index}", ""])
+        if posture or timeline:
+            alert = _posture_alert(posture or timeline)
+            detail = " ".join(
+                part
+                for part in (
+                    f"**{_md(posture)} posture.**" if posture else "",
+                    _md(timeline) + "." if timeline else "",
+                    f"Risk score {_md(assessment.get('overall_risk_score'))}."
+                    if assessment.get("overall_risk_score") is not None
+                    else "",
+                    f"{_md(assessment.get('total_failed_tests'))} failed tests."
+                    if assessment.get("total_failed_tests") is not None
+                    else "",
+                )
+                if part
+            )
+            lines.extend([f"> [!{alert}]", f"> {detail}", ""])
+
+        lines.extend(
+            [
+                "| Metric | Value |",
+                "| --- | --- |",
+                f"| Security posture | {_md(posture)} |",
+                f"| Timeline | {_md(timeline)} |",
+                f"| Failed tests | {_md(assessment.get('total_failed_tests'))} |",
+                f"| Critical | {_md(assessment.get('critical_vulnerabilities'))} |",
+                f"| Risk score | {_md(assessment.get('overall_risk_score'))} |",
+                "",
+            ]
+        )
+
+        findings = summary.get("key_findings") or []
+        if isinstance(findings, list) and findings:
+            lines.append("### Key findings")
+            lines.append("")
+            lines.extend(_render_block(findings, 4))
+
+        covered = {"executive_summary", "overall_assessment", "prioritized_actions"}
+        if actions:
+            lines.extend(["### Prioritized actions", ""])
+            for index, action in enumerate(actions, start=1):
+                if isinstance(action, dict):
+                    lines.extend(_render_action(action, index))
+                else:
+                    lines.extend(_render_block(action, 4))
+
+        leftover_summary = {
+            key: value
+            for key, value in summary.items()
+            if key not in {"security_status", "key_findings", "recommended_timeline"}
+        }
+        leftover_assessment = {
+            key: value
+            for key, value in assessment.items()
+            if key
+            not in {
+                "security_posture",
+                "remediation_timeline",
+                "total_failed_tests",
+                "critical_vulnerabilities",
+                "overall_risk_score",
+            }
+        }
+        if leftover_summary:
+            lines.extend(["### Executive summary", ""])
+            lines.extend(_render_block(leftover_summary))
+        if leftover_assessment:
+            lines.extend(["### Overall assessment", ""])
+            lines.extend(_render_block(leftover_assessment))
+
+        for key, value in document.items():
+            if key in covered:
+                continue
+            lines.extend([f"### {_label(key)}", ""])
+            lines.extend(_render_block(value, 4))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def publish_recommendations(client: WhiteHaxClient, report_id: str) -> None:
+    print(f"[INFO] Report {report_id} is ready; loading recommendations")
+    try:
+        payload = client.get_recommendations(report_id)
+    except Exception as exc:
+        print(
+            f"[WARN] Recommendations unavailable for report {report_id}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        return
+
+    if isinstance(payload, dict):
+        print(f"[INFO] Recommendations payload keys: {', '.join(payload.keys()) or '(none)'}")
+    elif isinstance(payload, list):
+        print(f"[INFO] Recommendations payload is a list of {len(payload)} item(s)")
+    else:
+        print(f"[INFO] Recommendations payload type: {type(payload).__name__}")
+
+    assessment, summary, actions = _recommendation_view(payload)
+    posture = assessment.get("security_posture") or summary.get("security_status") or "unknown"
+    timeline = assessment.get("remediation_timeline") or summary.get("recommended_timeline") or "unknown"
+    print(
+        f"[INFO] Recommendations summary posture={posture} timeline={timeline} "
+        f"failed_tests={assessment.get('total_failed_tests', 'n/a')} "
+        f"critical={assessment.get('critical_vulnerabilities', 'n/a')} "
+        f"actions={len(actions)}"
+    )
+    for index, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            print(f"[INFO] Action {index}/{len(actions)}: {action}")
+            continue
+        print(
+            f"[INFO] Action {index}/{len(actions)} "
+            f"priority={action.get('priority') or 'n/a'} "
+            f"category={action.get('category') or 'n/a'} "
+            f"action={action.get('action') or 'n/a'}"
+        )
+
+    markdown = format_recommendations(payload, report_id)
+    print("::group::WhiteHax recommendations")
+    print(markdown)
+    print("::endgroup::")
+
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        print("[INFO] GITHUB_STEP_SUMMARY is unset; recommendations stay in the job log")
+        return
+    with open(summary_path, "a", encoding="utf-8") as handle:
+        handle.write(markdown + "\n")
+    print(f"[INFO] Wrote recommendations to GitHub step summary ({summary_path})")
+
 
 def _risk_to_severity(risk: Any, default: str = "medium") -> str:
     text = str(risk or "").strip().lower()
@@ -432,25 +744,27 @@ def run_whitehax_scan(whitehax_url: str, api_key: str, target_url: str) -> list[
     if report_id:
         print(f"[INFO] Using existing report id={report_id} (skip job start)")
         report = client.get_report(report_id)
-        return findings_from_report(report, target_url)
-
-    profile_id_raw = os.environ.get("WHITEHAX_PROFILE_ID", "").strip()
-    create_resources = env_bool("WHITEHAX_CREATE_RESOURCES", default=not bool(profile_id_raw))
-
-    if create_resources:
-        endpoint_id = client.create_endpoint(target_url)
-        profile_id = client.create_profile(endpoint_id)
     else:
-        profile_id = int(profile_id_raw)
-        print(f"[INFO] Reusing WhiteHax profile id={profile_id}")
+        profile_id_raw = os.environ.get("WHITEHAX_PROFILE_ID", "").strip()
+        create_resources = env_bool("WHITEHAX_CREATE_RESOURCES", default=not bool(profile_id_raw))
 
-    report_name = os.environ.get(
-        "WHITEHAX_REPORT_NAME",
-        f"github-actions-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
-    )
-    job_id = client.start_job(profile_id, report_name)
-    report_id = client.wait_for_report_id(job_id)
-    report = client.get_report(report_id)
+        if create_resources:
+            endpoint_id = client.create_endpoint(target_url)
+            profile_id = client.create_profile(endpoint_id)
+        else:
+            profile_id = int(profile_id_raw)
+            print(f"[INFO] Reusing WhiteHax profile id={profile_id}")
+
+        report_name = os.environ.get(
+            "WHITEHAX_REPORT_NAME",
+            f"github-actions-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+        )
+        job_id = client.start_job(profile_id, report_name)
+        report_id = client.wait_for_report_id(job_id)
+        print(f"[INFO] Job finished; report id={report_id}")
+        report = client.get_report(report_id)
+
+    publish_recommendations(client, report_id)
     return findings_from_report(report, target_url)
 
 
