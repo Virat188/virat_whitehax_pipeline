@@ -532,13 +532,88 @@ def _render_action(action: dict[str, Any], index: int) -> list[str]:
     return lines
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _dos_actions(recommendations: Any) -> list[Any]:
+    """Flatten recomm_for=dos recommendation buckets into the action list."""
+    if not isinstance(recommendations, dict):
+        return []
+    buckets = (
+        ("critical_immediate", "critical"),
+        ("high_priority", "high"),
+        ("medium_priority", "medium"),
+        ("low_priority", "low"),
+        ("monitoring", "info"),
+        ("maintenance", "info"),
+    )
+    actions: list[Any] = []
+    for bucket, priority in buckets:
+        items = recommendations.get(bucket) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                actions.append(item)
+                continue
+            actions.append(
+                {
+                    "priority": item.get("risk_level") or priority,
+                    "action": item.get("recommendation") or item.get("action") or item.get("attack_type"),
+                    "category": item.get("attack_type") or bucket,
+                    "description": item.get("details"),
+                    "implementation": item.get("implementation") or [],
+                }
+            )
+    return actions
+
+
+def _dos_assessment(data: dict[str, Any]) -> dict[str, Any]:
+    """Map a DoS recommendation payload onto the summary fields the markdown table uses."""
+    security = _as_dict(data.get("security_assessment"))
+    executive = _as_dict(data.get("executive_summary"))
+    if not security and not executive:
+        return {}
+    counts = _as_dict(security.get("summary")) or _as_dict(executive.get("summary"))
+    risk_summary = _as_dict(security.get("risk_summary"))
+    critical_bucket = risk_summary.get("critical")
+    critical = len(critical_bucket) if isinstance(critical_bucket, list) else critical_bucket
+    posture = (
+        security.get("security_posture")
+        or executive.get("security_posture")
+        or security.get("overall_risk")
+        or executive.get("overall_risk")
+    )
+    recommendations = data.get("recommendations")
+    immediate = isinstance(recommendations, dict) and bool(recommendations.get("critical_immediate"))
+    timeline = ""
+    if immediate or (isinstance(posture, str) and "immediate" in posture.lower()):
+        timeline = "IMMEDIATE"
+    failed = counts.get("total_failed")
+    if failed is None:
+        failed = executive.get("vulnerabilities_count")
+    return {
+        "security_posture": posture,
+        "remediation_timeline": timeline,
+        "total_failed_tests": failed,
+        "critical_vulnerabilities": critical,
+        "overall_risk_score": security.get("overall_risk") or executive.get("overall_risk"),
+    }
+
+
 def _recommendation_view(payload: Any) -> tuple[dict[str, Any], dict[str, Any], list[Any]]:
     data = payload[0] if isinstance(payload, list) and payload else payload
     if not isinstance(data, dict):
         return {}, {}, []
     assessment = data.get("overall_assessment")
+    if not isinstance(assessment, dict) or not assessment:
+        assessment = _dos_assessment(data)
     summary = data.get("executive_summary")
     actions = data.get("prioritized_actions")
+    if not isinstance(actions, list) or not actions:
+        recommendations = data.get("recommendations")
+        actions = recommendations if isinstance(recommendations, list) else _dos_actions(recommendations)
     return (
         assessment if isinstance(assessment, dict) else {},
         summary if isinstance(summary, dict) else {},
@@ -614,6 +689,10 @@ def format_recommendations(payload: Any, report_id: str) -> str:
             lines.extend(_render_block(findings, 4))
 
         covered = {"executive_summary", "overall_assessment", "prioritized_actions"}
+        if not isinstance(document.get("prioritized_actions"), list) and isinstance(
+            document.get("recommendations"), dict
+        ):
+            covered.add("recommendations")
         if actions:
             lines.extend(["### Prioritized actions", ""])
             for index, action in enumerate(actions, start=1):
@@ -1218,4 +1297,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-#
+    '''
+    gh workflow run whitehax-dast.yml -f target_url="<target>" -f profile_id="<profile_id>"
+    '''
