@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-WhiteHax GitHub Actions SARIF bridge.
+WhiteHax CI DAST bridge.
 
-Stable CI/SARIF handling plus a WhiteHax REST API adapter that:
+Stable CI handling plus a WhiteHax REST API adapter that:
 1. authenticates (API key + email/password session),
 2. starts a job against a configured profile (optionally creating an endpoint for TARGET_URL),
 3. polls until the job completes,
-4. fetches the report and maps failed tests into SARIF findings,
-5. fetches recommendations and writes them to the GitHub job summary.
+4. fetches the report and maps failed tests into findings,
+5. fetches recommendations and writes them to the job summary.
+
+GitHub Actions writes whitehax_results.sarif.
+GitLab CI (GITLAB_CI=true, or WHITEHAX_REPORT_FORMAT=gitlab) writes gl-dast-report.json.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -20,12 +24,19 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 
 
 OUTPUT_FILE = Path("whitehax_results.sarif")
+GITLAB_OUTPUT_FILE = Path("gl-dast-report.json")
+RECOMMENDATIONS_FILE = Path("whitehax-recommendations.md")
+GITLAB_REPORT_VERSION = "15.0.7"
+GITLAB_SCHEMA = (
+    "https://gitlab.com/gitlab-org/security-products/security-report-schemas/"
+    "-/raw/v15.0.7/dist/dast-report-format.json"
+)
 # GitHub code scanning rejects http(s) artifact URIs from a file:// checkout.
 # Keep DAST target URLs in the finding message instead.
 SARIF_ARTIFACT_URI = "whitehax_scans/whitehax_tests.py"
@@ -46,7 +57,60 @@ DEFAULT_POLL_TIMEOUT = 3600
 DEFAULT_RECOMM_TIMEOUT = 120
 # recomm_for selects the generator. "full" is the prompts-and-docs profile.
 RECOMM_FOR_VALUES = ("full", "rto", "dos", "mcp", "reg", "llm")
+PROFILE_TYPE_TO_RECOMM_FOR = {
+    "dos_tester": "dos",
+    "rto": "rto",
+    "mcp_tester": "mcp",
+    "regulation_compliance": "reg",
+    "prompts_docs_llm": "full",
+    "ai_model_attack_surface": "llm",
+}
 RECOMM_LANGS = ("en", "fr", "es")
+GITLAB_SEVERITIES = {
+    "critical": "Critical",
+    "severe": "Critical",
+    "high": "High",
+    "error": "High",
+    "medium": "Medium",
+    "warning": "Medium",
+    "low": "Low",
+    "info": "Info",
+    "informational": "Info",
+    "note": "Info",
+    "none": "Info",
+    "unknown": "Unknown",
+}
+
+
+def recomm_for_profile_type(profile_type: str) -> str:
+    """Map a WhiteHax profile_type to the recommendations recomm_for query value."""
+    return PROFILE_TYPE_TO_RECOMM_FOR.get(profile_type.strip().lower(), "full")
+
+
+def report_format() -> str:
+    """sarif for GitHub Actions, gitlab for GitLab CI."""
+    explicit = os.environ.get("WHITEHAX_REPORT_FORMAT", "").strip().lower()
+    if explicit in {"gitlab", "dast"}:
+        return "gitlab"
+    if explicit in {"sarif", "github"}:
+        return "sarif"
+    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
+        return "gitlab"
+    return "sarif"
+
+
+def _bridge_label() -> str:
+    if report_format() == "gitlab":
+        return "GitLab CI WhiteHax DAST bridge"
+    return "GitHub Actions WhiteHax DAST bridge"
+
+
+def resolve_target_url() -> str:
+    for name in ("TARGET_URL", "WHITEHAX_TARGET_URL", "CI_ENVIRONMENT_URL"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def require_env(name: str) -> str:
@@ -134,6 +198,7 @@ class WhiteHaxClient:
         self.email = email
         self.password = password
         self.session_key = ""
+        self.profile_type = ""
 
     def _headers(self, with_session: bool = True) -> dict[str, str]:
         headers = {"Authorization": self.api_key}
@@ -163,7 +228,10 @@ class WhiteHaxClient:
             f"ci-endpoint-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
         )
         endpoint_type = os.environ.get("WHITEHAX_ENDPOINT_TYPE", "api_endpoint")
-        endpoint_description = os.environ.get("WHITEHAX_ENDPOINT_DESCRIPTION", "Created by GitHub Actions WhiteHax DAST bridge")
+        endpoint_description = os.environ.get(
+            "WHITEHAX_ENDPOINT_DESCRIPTION",
+            f"Created by {_bridge_label()}",
+        )
         request_json = json.loads(os.environ.get("WHITEHAX_REQUEST_JSON", "{}"))
         response_json = json.loads(os.environ.get("WHITEHAX_RESPONSE_JSON", "{}"))
 
@@ -203,7 +271,7 @@ class WhiteHaxClient:
         )
         profile_description = os.environ.get(
             "WHITEHAX_PROFILE_DESCRIPTION",
-            "Created by GitHub Actions WhiteHax DAST bridge",
+            f"Created by {_bridge_label()}",
         )
         profile_type = os.environ.get("WHITEHAX_PROFILE_TYPE", "prompts_docs_llm")
         retry_attempts = env_int("WHITEHAX_RETRY_ATTEMPTS", 2)
@@ -247,8 +315,23 @@ class WhiteHaxClient:
         profile_id = result.get("id")
         if profile_id is None:
             raise RuntimeError(f"Profile create response missing id: {result}")
-        print(f"[INFO] Created WhiteHax profile id={profile_id}")
+        self.profile_type = profile_type
+        print(f"[INFO] Created WhiteHax profile id={profile_id} profile_type={profile_type}")
         return int(profile_id)
+
+    def get_profile(self, profile_id: int) -> dict[str, Any]:
+        payload = _request(
+            "GET",
+            f"{self.base_url}/api/profiles-config/getProfileById/{profile_id}",
+            headers=self._headers(),
+        )
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            payload = payload["data"]
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unexpected profile payload type: {type(payload)}")
+        profile_type = str(payload.get("profile_type") or "")
+        self.profile_type = profile_type
+        return payload
 
     def start_job(self, profile_id: int, report_name: str) -> str:
         result = _request(
@@ -260,7 +343,10 @@ class WhiteHaxClient:
         job_id = result.get("job_id")
         if job_id is None:
             raise RuntimeError(f"Job create response missing job_id: {result}")
-        print(f"[INFO] Started WhiteHax job id={job_id} for profile_id={profile_id}")
+        print(
+            f"[INFO] Started WhiteHax job id={job_id} for profile_id={profile_id} "
+            f"profile_type={self.profile_type or 'unknown'}"
+        )
         return str(job_id)
 
     def wait_for_report_id(self, job_id: str) -> str:
@@ -315,7 +401,16 @@ class WhiteHaxClient:
         - lang: en (default), fr, es
         - consolidation: false reads the result table; true reads consolidated_report
         """
-        recomm_for = os.environ.get("WHITEHAX_RECOMM_FOR", "full").strip().lower() or "full"
+        explicit = os.environ.get("WHITEHAX_RECOMM_FOR", "").strip().lower()
+        if explicit:
+            recomm_for = explicit
+        elif self.profile_type:
+            recomm_for = recomm_for_profile_type(self.profile_type)
+            print(
+                f"[INFO] profile_type={self.profile_type} selects recomm_for={recomm_for}"
+            )
+        else:
+            recomm_for = "full"
         lang = os.environ.get("WHITEHAX_LANG", "en").strip().lower() or "en"
         consolidation = env_bool("WHITEHAX_CONSOLIDATION", default=False)
         timeout = env_int("WHITEHAX_RECOMM_TIMEOUT", DEFAULT_RECOMM_TIMEOUT)
@@ -570,6 +665,9 @@ def publish_recommendations(client: WhiteHaxClient, report_id: str) -> None:
             file=sys.stderr,
         )
         traceback.print_exc()
+        _ensure_recommendations_artifact(
+            f"Recommendations unavailable for report {report_id}: {exc}"
+        )
         return
 
     if isinstance(payload, dict):
@@ -600,9 +698,9 @@ def publish_recommendations(client: WhiteHaxClient, report_id: str) -> None:
         )
 
     markdown = format_recommendations(payload, report_id)
-    print("::group::WhiteHax recommendations")
-    print(markdown)
-    print("::endgroup::")
+    _print_recommendation_log(markdown)
+    if report_format() == "gitlab":
+        _write_recommendations_file(markdown)
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if not summary_path:
@@ -611,6 +709,32 @@ def publish_recommendations(client: WhiteHaxClient, report_id: str) -> None:
     with open(summary_path, "a", encoding="utf-8") as handle:
         handle.write(markdown + "\n")
     print(f"[INFO] Wrote recommendations to GitHub step summary ({summary_path})")
+
+
+def _print_recommendation_log(markdown: str) -> None:
+    if os.environ.get("GITLAB_CI", "").strip().lower() == "true":
+        stamp = str(int(time.time()))
+        print(
+            f"\033[0Ksection_start:{stamp}:whitehax_recommendations\r\033[0K"
+            "WhiteHax recommendations"
+        )
+        print(markdown)
+        print(f"\033[0Ksection_end:{stamp}:whitehax_recommendations\r\033[0K")
+        return
+    print("::group::WhiteHax recommendations")
+    print(markdown)
+    print("::endgroup::")
+
+
+def _write_recommendations_file(markdown: str) -> None:
+    RECOMMENDATIONS_FILE.write_text(markdown, encoding="utf-8")
+    print(f"[INFO] Wrote recommendations to {RECOMMENDATIONS_FILE}")
+
+
+def _ensure_recommendations_artifact(message: str) -> None:
+    if report_format() != "gitlab" or RECOMMENDATIONS_FILE.exists():
+        return
+    _write_recommendations_file(f"## WhiteHax recommendations\n\n{message.strip()}\n")
 
 
 def _risk_to_severity(risk: Any, default: str = "medium") -> str:
@@ -744,6 +868,13 @@ def run_whitehax_scan(whitehax_url: str, api_key: str, target_url: str) -> list[
     if report_id:
         print(f"[INFO] Using existing report id={report_id} (skip job start)")
         report = client.get_report(report_id)
+        summary = report.get("profile_details_summary") or {}
+        if isinstance(summary, dict) and summary.get("profile_type"):
+            client.profile_type = str(summary["profile_type"])
+            print(
+                f"[INFO] Report profile id={report.get('profile_id')} "
+                f"profile_type={client.profile_type}"
+            )
     else:
         profile_id_raw = os.environ.get("WHITEHAX_PROFILE_ID", "").strip()
         create_resources = env_bool("WHITEHAX_CREATE_RESOURCES", default=not bool(profile_id_raw))
@@ -753,11 +884,16 @@ def run_whitehax_scan(whitehax_url: str, api_key: str, target_url: str) -> list[
             profile_id = client.create_profile(endpoint_id)
         else:
             profile_id = int(profile_id_raw)
-            print(f"[INFO] Reusing WhiteHax profile id={profile_id}")
+            profile = client.get_profile(profile_id)
+            print(
+                f"[INFO] Reusing WhiteHax profile id={profile_id} "
+                f"profile_type={profile.get('profile_type') or 'unknown'}"
+            )
 
+        report_prefix = "gitlab-ci" if report_format() == "gitlab" else "github-actions"
         report_name = os.environ.get(
             "WHITEHAX_REPORT_NAME",
-            f"github-actions-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
+            f"{report_prefix}-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}",
         )
         job_id = client.start_job(profile_id, report_name)
         report_id = client.wait_for_report_id(job_id)
@@ -866,21 +1002,215 @@ def write_sarif(payload: dict[str, Any]) -> None:
     print(f"[INFO] Wrote SARIF results to {OUTPUT_FILE}")
 
 
+def _gitlab_severity(value: Any) -> str:
+    return GITLAB_SEVERITIES.get(str(value or "").strip().lower(), "Unknown")
+
+
+def _gitlab_timestamp(moment: datetime | None = None) -> str:
+    # GitLab's DAST schema rejects offsets. These clocks are UTC.
+    current = moment or datetime.now(timezone.utc)
+    return current.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _stable_finding_id(finding_id: str, hostname: str, path: str) -> str:
+    raw = "|".join([finding_id, hostname, path])
+    return "whitehax-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _finding_location(uri: str, target_url: str) -> tuple[str, str, str]:
+    """Return GitLab hostname (scheme, host, port), URL path, and link URL."""
+    parsed_target = urlparse(target_url)
+    if parsed_target.scheme and parsed_target.netloc:
+        base_host = f"{parsed_target.scheme}://{parsed_target.netloc}"
+        base_path = parsed_target.path or "/"
+    else:
+        base_host = target_url or "unknown-target.invalid"
+        base_path = "/"
+
+    link = ""
+    if not uri or uri == target_url:
+        path = base_path
+        if parsed_target.scheme in {"http", "https", "ftp"}:
+            link = target_url
+    else:
+        parsed_uri = urlparse(uri)
+        if parsed_uri.scheme and parsed_uri.netloc:
+            base_host = f"{parsed_uri.scheme}://{parsed_uri.netloc}"
+            path = parsed_uri.path or "/"
+            if parsed_uri.scheme in {"http", "https", "ftp"}:
+                link = uri
+        else:
+            path = "/" + uri.lstrip("/")
+            if parsed_target.scheme in {"http", "https", "ftp"}:
+                link = f"{base_host}{path}"
+
+    if not path.startswith("/"):
+        path = "/" + path
+    return base_host, path, link
+
+
+def build_gitlab_dast(
+    findings: list[dict[str, Any]],
+    target_url: str,
+    execution_error: str | None = None,
+) -> dict[str, Any]:
+    started = _gitlab_timestamp()
+    vulnerabilities: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    scanned: list[dict[str, str]] = []
+    scanned_urls: set[str] = set()
+
+    def add_scanned(url: str) -> None:
+        if not url or url in scanned_urls:
+            return
+        if not url.startswith(("http://", "https://", "ftp://")):
+            return
+        scanned_urls.add(url)
+        scanned.append({"method": "GET", "type": "url", "url": url})
+
+    add_scanned(target_url)
+
+    def add_vulnerability(entry: dict[str, Any]) -> None:
+        finding_id = entry["id"]
+        candidate = finding_id
+        suffix = 2
+        while candidate in seen_ids:
+            candidate = f"{finding_id}-{suffix}"
+            suffix += 1
+        seen_ids.add(candidate)
+        entry["id"] = candidate
+        vulnerabilities.append(entry)
+
+    for raw in findings:
+        title = str(raw.get("title") or raw.get("name") or "WhiteHax finding")[:255]
+        description = str(raw.get("description") or raw.get("message") or title)[:4000]
+        hostname, path, link = _finding_location(str(raw.get("uri") or ""), target_url)
+        rule_id = str(raw.get("id") or raw.get("rule_id") or "WHX-GENERIC")
+        entry = {
+            "id": _stable_finding_id(rule_id, hostname, path),
+            "category": "dast",
+            "name": title,
+            "message": description or title,
+            "description": description or title,
+            "severity": _gitlab_severity(raw.get("severity")),
+            "confidence": "Confirmed",
+            "scanner": {"id": "whitehax_engine", "name": "WhiteHax Scan Core"},
+            "identifiers": [
+                {
+                    "type": "whitehax_id",
+                    "name": rule_id,
+                    "value": rule_id,
+                }
+            ],
+            "location": {
+                "hostname": hostname,
+                "path": path,
+            },
+        }
+        if link:
+            entry["links"] = [{"url": link}]
+            add_scanned(link)
+        add_vulnerability(entry)
+
+    status = "success"
+    if execution_error:
+        status = "failure"
+        hostname, path, _link = _finding_location("", target_url)
+        error_text = execution_error[:4000]
+        add_vulnerability(
+            {
+                "id": _stable_finding_id("WHX-SCAN-ERROR", hostname, path),
+                "category": "dast",
+                "name": "WhiteHax scan execution error",
+                "message": error_text,
+                "description": error_text,
+                "severity": "Unknown",
+                "confidence": "Confirmed",
+                "scanner": {"id": "whitehax_engine", "name": "WhiteHax Scan Core"},
+                "identifiers": [
+                    {
+                        "type": "whitehax_error",
+                        "name": "WHX-SCAN-ERROR",
+                        "value": "WHX-SCAN-ERROR",
+                    }
+                ],
+                "location": {
+                    "hostname": hostname,
+                    "path": path or "/",
+                },
+            }
+        )
+
+    report: dict[str, Any] = {
+        "version": GITLAB_REPORT_VERSION,
+        "schema": GITLAB_SCHEMA,
+        "scan": {
+            "analyzer": {
+                "id": "whitehax-dast",
+                "name": "WhiteHax DAST Plugin",
+                "vendor": {"name": "WhiteHax Sec"},
+                "version": "1.0.0",
+            },
+            "scanner": {
+                "id": "whitehax_engine",
+                "name": "WhiteHax Scan Core",
+                "vendor": {"name": "WhiteHax Sec"},
+                "version": "1.0.0",
+            },
+            "type": "dast",
+            "start_time": started,
+            "end_time": _gitlab_timestamp(),
+            "status": status,
+            "scanned_resources": scanned,
+        },
+        "vulnerabilities": vulnerabilities,
+    }
+    if execution_error:
+        report["scan"]["messages"] = [{"level": "fatal", "value": execution_error[:4000]}]
+    return report
+
+
+def write_gitlab_dast(payload: dict[str, Any]) -> None:
+    GITLAB_OUTPUT_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"[INFO] Wrote GitLab DAST report to {GITLAB_OUTPUT_FILE}")
+
+
+def write_report(
+    findings: list[dict[str, Any]],
+    target_url: str,
+    execution_error: str | None = None,
+) -> None:
+    if report_format() == "gitlab":
+        write_gitlab_dast(build_gitlab_dast(findings, target_url, execution_error))
+        print(f"[INFO] Mapped {len(findings)} finding(s) into GitLab DAST report")
+        return
+    write_sarif(build_sarif(findings, target_url, execution_error))
+    print(f"[INFO] Mapped {len(findings)} finding(s) into SARIF")
+
+
 def main() -> int:
-    target_url = os.environ.get("TARGET_URL", "")
+    target_url = resolve_target_url()
     try:
-        whitehax_url = require_env("WHITEHAX_URL") 
+        whitehax_url = require_env("WHITEHAX_URL")
         api_key = require_env("WHITEHAX_API_KEY")
+        if report_format() == "gitlab" and not target_url:
+            raise RuntimeError(
+                "Missing target URL. Set TARGET_URL, WHITEHAX_TARGET_URL, or CI_ENVIRONMENT_URL"
+            )
 
         print("[INFO] Starting WhiteHax DAST verification")
         print(f"[INFO] Target URL: {target_url}")
+        print(f"[INFO] Report format: {report_format()}")
         findings = run_whitehax_scan(whitehax_url, api_key, target_url)
-        write_sarif(build_sarif(findings, target_url))
-        print(f"[INFO] Mapped {len(findings)} finding(s) into SARIF")
+        write_report(findings, target_url)
     except Exception as exc:
         print("[ERROR] WhiteHax scan failed:", exc, file=sys.stderr)
         traceback.print_exc()
-        write_sarif(build_sarif([], target_url or "about:blank", str(exc)))
+        fallback = target_url or (
+            "https://unknown-target.invalid" if report_format() == "gitlab" else "about:blank"
+        )
+        write_report([], fallback, str(exc))
+        _ensure_recommendations_artifact(f"WhiteHax scan failed: {exc}")
         if os.environ.get("WHITEHAX_FAIL_ON_ERROR", "false").lower() == "true":
             return 1
     return 0
@@ -888,3 +1218,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+#
