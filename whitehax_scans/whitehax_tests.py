@@ -32,7 +32,6 @@ import requests
 OUTPUT_FILE = Path("whitehax_results.sarif")
 GITLAB_OUTPUT_FILE = Path("gl-dast-report.json")
 RECOMMENDATIONS_FILE = Path("whitehax-recommendations.md")
-FORMATTED_RECOMMENDATIONS_FILE = Path("whitehax-recommendations-formatted.md")
 GITLAB_REPORT_VERSION = "15.0.7"
 GITLAB_SCHEMA = (
     "https://gitlab.com/gitlab-org/security-products/security-report-schemas/"
@@ -778,15 +777,16 @@ def publish_recommendations(client: WhiteHaxClient, report_id: str) -> None:
         )
 
     markdown = format_recommendations(payload, report_id)
-    display = _publish_recommendation_artifacts(markdown)
-    _print_recommendation_log(display)
+    _print_recommendation_log(markdown)
+    if report_format() == "gitlab":
+        _write_recommendations_file(markdown)
 
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
     if not summary_path:
         print("[INFO] GITHUB_STEP_SUMMARY is unset; recommendations stay in the job log")
         return
     with open(summary_path, "a", encoding="utf-8") as handle:
-        handle.write(display + "\n")
+        handle.write(markdown + "\n")
     print(f"[INFO] Wrote recommendations to GitHub step summary ({summary_path})")
 
 
@@ -810,40 +810,10 @@ def _write_recommendations_file(markdown: str) -> None:
     print(f"[INFO] Wrote recommendations to {RECOMMENDATIONS_FILE}")
 
 
-def _format_recommendations_file() -> Path | None:
-    """Run utils/format_whitehax_report.py through the CI interface, unchanged."""
-    if not RECOMMENDATIONS_FILE.is_file():
-        return None
-    repo_root = Path(__file__).resolve().parent.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    try:
-        from utils.report_format_interface import format_report_file
-    except ImportError as exc:
-        print(f"[WARN] Report formatter interface unavailable: {exc}", file=sys.stderr)
-        return None
-    try:
-        output = format_report_file(RECOMMENDATIONS_FILE, overwrite=True)
-    except (OSError, RuntimeError, ValueError) as exc:
-        print(f"[WARN] Recommendation formatting skipped: {exc}", file=sys.stderr)
-        return None
-    print(f"[INFO] Formatted recommendations ready: {output}")
-    return output
-
-
-def _publish_recommendation_artifacts(markdown: str) -> str:
-    """Write the raw report, format it via the interface, and return display text."""
-    _write_recommendations_file(markdown)
-    formatted_path = _format_recommendations_file()
-    if formatted_path and formatted_path.is_file():
-        return formatted_path.read_text(encoding="utf-8")
-    return markdown
-
-
 def _ensure_recommendations_artifact(message: str) -> None:
-    if RECOMMENDATIONS_FILE.exists():
+    if report_format() != "gitlab" or RECOMMENDATIONS_FILE.exists():
         return
-    _publish_recommendation_artifacts(f"## WhiteHax recommendations\n\n{message.strip()}\n")
+    _write_recommendations_file(f"## WhiteHax recommendations\n\n{message.strip()}\n")
 
 
 def _risk_to_severity(risk: Any, default: str = "medium") -> str:
@@ -1330,5 +1300,5 @@ if __name__ == "__main__":
     '''
     gh workflow run whitehax-dast.yml -f target_url="<target>" -f profile_id="<profile_id>"
     '''
-
-##
+    ###
+    
